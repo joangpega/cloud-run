@@ -16,12 +16,12 @@ def enviar_eventos_diarios(request):
       event_date AS fecha,
       COUNT(*) AS total_eventos
     FROM
-      `projectid.tableid.events_*`
+      `projectid.table.events_*`
     WHERE
       _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
       AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
     GROUP BY fecha
-    ORDER BY fecha desc
+    ORDER BY fecha DESC
     """
     results = client.query(QUERY).result()
 
@@ -34,58 +34,84 @@ def enviar_eventos_diarios(request):
     if not eventos:
         return 'No se encontraron datos'
 
-    # Crear gráfico
-    plt.figure(figsize=(8, 5))
-    plt.bar(fechas, eventos, label="Eventos diarios", color='skyblue')
-    plt.axhline(y=LIMITE_EVENTOS, color='red', linestyle='--', label="Límite (1M)")
-    plt.xlabel("Fecha")
-    plt.ylabel("Eventos")
+    # Invertir para orden cronológico ascendente
+    fechas.reverse()
+    eventos.reverse()
+
+    # Crear gráfico con doble eje Y
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    ax1.bar(fechas, eventos, label="Eventos diarios", color='skyblue')
+    ax1.set_xlabel("Fecha")
+    ax1.set_ylabel("Eventos diarios", color='skyblue')
+    ax1.tick_params(axis='y', labelcolor='skyblue')
+    ax1.set_xticklabels(fechas, rotation=45)
+
+    ax2 = ax1.twinx()
+    ax2.axhline(y=LIMITE_EVENTOS, color='red', linestyle='--', label="Límite (1M)")
+    ax2.set_ylabel("Límite eventos", color='red')
+    ax2.tick_params(axis='y', labelcolor='red')
+    ax2.set_ylim(0, max(LIMITE_EVENTOS, max(eventos)*1.1))
+
+    # Combinar leyendas
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
+
     plt.title("Eventos diarios últimos 7 días")
-    plt.xticks(rotation=45)
-    plt.legend()
     plt.tight_layout()
 
     img_bytes = io.BytesIO()
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
 
-    # Obtener secreto desde Secret Manager
+    # Obtener password de Secret Manager
     secret_client = secretmanager.SecretManagerServiceClient()
-    secret_name = f"projects/project_id/secrets/secreto/versions/latest"
+    secret_name = f"projects/projectid/secrets/secreto/versions/latest"
     gmail_password = secret_client.access_secret_version(name=secret_name).payload.data.decode("UTF-8")
 
-    # Construir email con imagen
-    msg = MIMEMultipart()
-    total_ultimo_dia = eventos[0]
+    # Preparar datos para email
+    total_ultimo_dia = eventos[-1]  # Último día tras invertir, es el más reciente
     porcentaje = (total_ultimo_dia / LIMITE_EVENTOS) * 100
-    if total_ultimo_dia >= LIMITE_EVENTOS:
-        estado = "🚨 Límite de eventos alcanzado"
+    
+    #Podemos ajustar el umbral
+    if porcentaje >= 90:
+        estado = "🚨 Límite de eventos alcanzado" if total_ultimo_dia >= LIMITE_EVENTOS else "⚠️ Aproximándose al límite"
+
+        # Construir email HTML con imagen inline
+        msg = MIMEMultipart('related')
+        msg['Subject'] = 'Google Cloud: límite de eventos diarios'
+        msg['From'] = 'email@gmail.com'
+        msg['To'] = 'email@gmail.com'
+        msg['Cc'] = 'emailencopia@perezgarcia.es'
+
+        html = f"""
+        <html>
+          <body>
+            <p>{estado}</p>
+            <p>Límite: {LIMITE_EVENTOS:,}</p>
+            <p>Porcentaje del límite (último día): {porcentaje:.2f}%</p>
+            <p>Eventos diarios últimos 7 días:</p>
+            <p>
+            El número de eventos diarios es: {total_ultimo_dia:,}<br>
+            </p><br>
+            <img src="cid:grafico" alt="Gráfico de eventos diarios"><br>
+
+          </body>
+        </html>
+        """
+        msg.attach(MIMEText(html, 'html'))
+
+        image = MIMEImage(img_bytes.read())
+        image.add_header('Content-ID', '<grafico>')
+        msg.attach(image)
+
+        # Enviar email
+        smtp = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        smtp.login('joangpega@gmail.com', gmail_password)
+        smtp.sendmail(msg['From'], [msg['To'], msg['Cc']], msg.as_string())
+        smtp.quit()
+
+        return 'Email enviado correctamente'
     else:
-        estado = "✅ Límite no alcanzado"
-
-    texto = f"""
-    {estado}
-
-    El número de eventos diarios es: {total_ultimo_dia:,}
-    Límite: {LIMITE_EVENTOS:,}
-    Porcentaje del límite: {porcentaje:.2f}%
-    """
-
-    msg.attach(MIMEText(texto, 'plain'))
-    msg['Subject'] = 'Google Cloud: límite de eventos diarios'
-    msg['From'] = '--@gmail.com'
-    msg['To'] = '--@gmail.com'
-    msg['Cc'] = '--@perezgarcia.es'
-
-    # Adjuntar imagen
-    image = MIMEImage(img_bytes.read())
-    image.add_header('Content-ID', '<grafico>')
-    msg.attach(image)
-
-    # Enviar email
-    smtp = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-    smtp.login('joangpega@gmail.com', gmail_password)
-    smtp.sendmail(msg['From'], [msg['To'], msg['Cc']], msg.as_string())
-    smtp.quit()
-
-    return 'Email enviado correctamente'
+        return f'No se envió email, porcentaje {porcentaje:.2f}% por debajo del umbral'
